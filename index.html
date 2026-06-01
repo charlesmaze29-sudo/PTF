@@ -674,15 +674,35 @@ function fetchWithTimeout(url, ms = 15000) {
   return fetch(url, { cache: 'no-store', signal: ctrl.signal }).finally(() => clearTimeout(id));
 }
 
-async function tdGet(path) {
+async function tdGet(path, retries = 3) {
   if (!settings.twelveDataKey) throw new Error('Clé Twelve Data manquante (onglet Réglages)');
   const sep = path.includes('?') ? '&' : '?';
   const url = `https://api.twelvedata.com${path}${sep}apikey=${encodeURIComponent(settings.twelveDataKey)}`;
-  const r = await fetchWithTimeout(url, 15000);
-  if (!r.ok) throw new Error('TD HTTP ' + r.status);
-  const j = await r.json();
-  if (j && j.status === 'error') throw new Error(j.message || 'Twelve Data error');
-  return j;
+  let lastErr = null;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const r = await fetchWithTimeout(url, 15000);
+      if (r.status === 429) {
+        // Rate limited — wait longer and retry
+        await new Promise(res => setTimeout(res, 12000 + attempt * 5000));
+        continue;
+      }
+      if (!r.ok) throw new Error('TD HTTP ' + r.status);
+      const j = await r.json();
+      if (j && j.status === 'error') {
+        if (j.code === 429) {
+          await new Promise(res => setTimeout(res, 12000 + attempt * 5000));
+          continue;
+        }
+        throw new Error(j.message || 'Twelve Data error');
+      }
+      return j;
+    } catch (e) {
+      lastErr = e;
+      if (attempt < retries - 1) await new Promise(res => setTimeout(res, 3000));
+    }
+  }
+  throw lastErr || new Error('TD failed after retries');
 }
 
 /* ============ HISTORICAL (YTD / MTD) ============ */
@@ -750,8 +770,11 @@ async function fetchAllQuotes() {
   const symbols = [...symMap.keys()];
   if (symbols.length === 0) return;
 
-  for (let i = 0; i < symbols.length; i += 25) {
-    const batch = symbols.slice(i, i + 25);
+  // Twelve Data charges 1 credit per symbol in batch. Free tier = 8 credits/min.
+  // Use batches of 8 symbols, spaced ~9s apart.
+  const BATCH = 8;
+  for (let i = 0; i < symbols.length; i += BATCH) {
+    const batch = symbols.slice(i, i + BATCH);
     const j = await tdGet(`/quote?symbol=${batch.map(encodeURIComponent).join(',')}`);
     const entries = (batch.length === 1) ? { [batch[0]]: j } : j;
     for (const [tdSym, data] of Object.entries(entries)) {
@@ -766,9 +789,15 @@ async function fetchAllQuotes() {
         time: data.datetime || new Date().toISOString().slice(0, 16).replace('T', ' ')
       };
     }
+    render(); // progressive update after each batch
+    // Wait between batches if more to come (stay under 8 credits/min)
+    if (i + BATCH < symbols.length) {
+      await new Promise(res => setTimeout(res, 9000));
+    }
   }
 
-  // FX EUR/USD
+  // FX EUR/USD (1 credit) — small wait first
+  await new Promise(res => setTimeout(res, 2000));
   try {
     const j = await tdGet('/price?symbol=EUR/USD');
     const eurusd = parseFloat(j.price);
