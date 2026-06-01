@@ -418,6 +418,8 @@
               <th data-sort="qty">Qté<span class="arrow">↕</span></th>
               <th data-sort="pru">PRU<span class="arrow">↕</span></th>
               <th data-sort="price">Cours<span class="arrow">↕</span></th>
+              <th data-sort="mtd">MTD<span class="arrow">↕</span></th>
+              <th data-sort="ytd">YTD<span class="arrow">↕</span></th>
               <th data-sort="value">Valeur €<span class="arrow">↕</span></th>
               <th data-sort="pl">P&L €<span class="arrow">↕</span></th>
               <th data-sort="plpct">P&L %<span class="arrow">↕</span></th>
@@ -484,18 +486,6 @@
           <button class="btn btn-secondary" id="syncCreate">＋ Créer nouveau Gist</button>
         </div>
         <div style="margin-top:14px; font-size:12px;">Statut <span class="sync-status" id="syncStatus">non configuré</span></div>
-      </div>
-
-      <div class="settings-section">
-        <h3>Patrimoine total</h3>
-        <div class="desc">Sert au calcul du % patrimoine par ligne (au-delà du portefeuille titres trackés ici).</div>
-        <div class="field" style="max-width:300px;">
-          <label>Patrimoine total (EUR)</label>
-          <input id="patriTotal" type="number" step="1000" placeholder="470000">
-        </div>
-        <div class="actions-row">
-          <button class="btn" id="savePatri">Enregistrer</button>
-        </div>
       </div>
 
       <div class="settings-section">
@@ -610,10 +600,10 @@ const INITIAL_PORTFOLIO = [
 let portfolio = [];
 let quotes = {};        // { ticker: { price, currency, time } }
 let fxUsdEur = null;    // 1 USD = X EUR
+let histCache = {};     // { ticker: { ytdBase, mtdBase, cachedOn } }
 let settings = {
   ghToken: '',
   gistId: '',
-  patrimoineTotal: 470000,
   refreshInterval: 60,
   sortBy: 'value',
   sortDir: 'desc'
@@ -624,6 +614,7 @@ let sleeveChart, envelopeChart, plChart;
 /* ============ STORAGE ============ */
 const LS_PORT = 'portfolioTracker.portfolio';
 const LS_SET = 'portfolioTracker.settings';
+const LS_HIST = 'portfolioTracker.histCache';
 
 function loadLocal() {
   try {
@@ -634,10 +625,15 @@ function loadLocal() {
     const s = localStorage.getItem(LS_SET);
     if (s) settings = { ...settings, ...JSON.parse(s) };
   } catch {}
+  try {
+    const h = localStorage.getItem(LS_HIST);
+    if (h) histCache = JSON.parse(h);
+  } catch {}
 }
 function saveLocal() {
   localStorage.setItem(LS_PORT, JSON.stringify(portfolio));
   localStorage.setItem(LS_SET, JSON.stringify(settings));
+  localStorage.setItem(LS_HIST, JSON.stringify(histCache));
 }
 
 /* ============ STOOQ TICKER MAPPING ============ */
@@ -659,19 +655,101 @@ function getCurrency(ticker) {
   return 'USD';
 }
 
+/* ============ HISTORICAL (YTD / MTD) ============ */
+function todayStr() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+async function fetchHistoricalForTicker(ticker) {
+  const cached = histCache[ticker];
+  const today = todayStr();
+  if (cached && cached.cachedOn === today) return cached;
+
+  const now = new Date();
+  // Range: from Dec 20 of previous year to today
+  const d1 = `${now.getFullYear() - 1}1220`;
+  const d2 = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+  const stooqSym = toStooqSymbol(ticker);
+  const url = `https://stooq.com/q/d/l/?s=${stooqSym}&d1=${d1}&d2=${d2}&i=d`;
+
+  try {
+    const text = await fetchUrl(url);
+    const lines = text.trim().split(/\r?\n/);
+    if (lines.length < 3) return null;
+    // Parse: Date,Open,High,Low,Close,Volume
+    const rows = [];
+    for (let i = 1; i < lines.length; i++) {
+      const parts = lines[i].split(',');
+      if (parts.length < 5) continue;
+      const date = parts[0];
+      const close = parseFloat(parts[4]);
+      if (!date || isNaN(close)) continue;
+      rows.push({ date, close });
+    }
+    if (rows.length < 2) return null;
+
+    // YTD base: last close strictly before Jan 1 of current year
+    const yearBoundary = `${now.getFullYear()}-01-01`;
+    let ytdBase = null;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (rows[i].date < yearBoundary) { ytdBase = rows[i].close; break; }
+    }
+    if (ytdBase == null) ytdBase = rows[0].close;
+
+    // MTD base: last close strictly before 1st of current month
+    const monthBoundary = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+    let mtdBase = null;
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (rows[i].date < monthBoundary) { mtdBase = rows[i].close; break; }
+    }
+    if (mtdBase == null) mtdBase = ytdBase;
+
+    const result = { ytdBase, mtdBase, cachedOn: today };
+    histCache[ticker] = result;
+    return result;
+  } catch (e) {
+    console.warn('Hist fetch failed for', ticker, e);
+    return null;
+  }
+}
+
+async function fetchAllHistorical() {
+  const today = todayStr();
+  const toFetch = portfolio.map(p => p.ticker).filter(t => histCache[t]?.cachedOn !== today);
+  if (toFetch.length === 0) return;
+
+  // Batch 4 in parallel to avoid hammering proxies
+  for (let i = 0; i < toFetch.length; i += 4) {
+    const batch = toFetch.slice(i, i + 4);
+    await Promise.all(batch.map(t => fetchHistoricalForTicker(t)));
+    saveLocal();
+    render(); // progressive UI update
+  }
+}
+
 /* ============ STOOQ FETCH ============ */
 async function fetchUrl(url) {
-  // Try direct first; fallback to CORS proxy if needed
-  try {
-    const r = await fetch(url, { cache: 'no-store' });
-    if (r.ok) return await r.text();
-    throw new Error('HTTP ' + r.status);
-  } catch (e) {
-    const proxied = 'https://corsproxy.io/?' + encodeURIComponent(url);
-    const r2 = await fetch(proxied, { cache: 'no-store' });
-    if (!r2.ok) throw new Error('proxy failed');
-    return await r2.text();
+  // Try direct first, then cascade through multiple CORS proxies
+  const attempts = [
+    url,
+    'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
+    'https://corsproxy.io/?' + encodeURIComponent(url),
+    'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(url),
+    'https://cors.eu.org/' + url
+  ];
+  let lastErr = null;
+  for (const attemptUrl of attempts) {
+    try {
+      const r = await fetch(attemptUrl, { cache: 'no-store' });
+      if (!r.ok) { lastErr = new Error('HTTP ' + r.status); continue; }
+      const text = await r.text();
+      if (text && text.length > 10) return text;
+      lastErr = new Error('réponse vide');
+    } catch (e) {
+      lastErr = e;
+    }
   }
+  throw lastErr || new Error('toutes les sources échouent');
 }
 
 function parseStooqCSV(text) {
@@ -750,7 +828,13 @@ function computePosition(p) {
   const cost = p.pru * p.qty;
   const pl = value != null ? value - cost : null;
   const plPct = (value != null && cost > 0) ? (pl / cost) * 100 : null;
-  return { priceLocal, priceEur, value, cost, pl, plPct, currency: getCurrency(p.ticker) };
+
+  // YTD / MTD perf based on local currency price (standard convention)
+  const h = histCache[p.ticker];
+  const ytdPct = (priceLocal != null && h?.ytdBase) ? (priceLocal - h.ytdBase) / h.ytdBase * 100 : null;
+  const mtdPct = (priceLocal != null && h?.mtdBase) ? (priceLocal - h.mtdBase) / h.mtdBase * 100 : null;
+
+  return { priceLocal, priceEur, value, cost, pl, plPct, ytdPct, mtdPct, currency: getCurrency(p.ticker) };
 }
 
 function aggregate() {
@@ -821,6 +905,8 @@ function renderPositionsTable(rows, totalValue) {
     qty: (a, b) => a.qty - b.qty,
     pru: (a, b) => a.pru - b.pru,
     price: (a, b) => (a.priceLocal ?? 0) - (b.priceLocal ?? 0),
+    mtd: (a, b) => (a.mtdPct ?? -Infinity) - (b.mtdPct ?? -Infinity),
+    ytd: (a, b) => (a.ytdPct ?? -Infinity) - (b.ytdPct ?? -Infinity),
     value: (a, b) => (a.value ?? 0) - (b.value ?? 0),
     pl: (a, b) => (a.pl ?? 0) - (b.pl ?? 0),
     plpct: (a, b) => (a.plPct ?? 0) - (b.plPct ?? 0),
@@ -838,7 +924,7 @@ function renderPositionsTable(rows, totalValue) {
   });
 
   const tbody = document.querySelector('#positionsTable tbody');
-  tbody.innerHTML = sorted.map((r, idx) => `
+  tbody.innerHTML = sorted.map((r) => `
     <tr>
       <td>
         <div class="ticker-cell">
@@ -849,6 +935,8 @@ function renderPositionsTable(rows, totalValue) {
       <td>${num(r.qty, r.qty % 1 === 0 ? 0 : 3)}</td>
       <td>${num(r.pru, 2)}</td>
       <td>${r.priceLocal != null ? num(r.priceLocal, 2) + ' ' + r.currency : '—'}</td>
+      <td class="${r.mtdPct == null ? '' : (r.mtdPct >= 0 ? 'pos' : 'neg')}">${pct(r.mtdPct)}</td>
+      <td class="${r.ytdPct == null ? '' : (r.ytdPct >= 0 ? 'pos' : 'neg')}">${pct(r.ytdPct)}</td>
       <td>${eur(r.value)}</td>
       <td class="${r.pl >= 0 ? 'pos' : 'neg'}">${signed(r.pl)}</td>
       <td class="${r.plPct >= 0 ? 'pos' : 'neg'}">${pct(r.plPct)}</td>
@@ -1077,6 +1165,9 @@ async function refresh() {
   try {
     await fetchAllQuotes();
     dot.className = 'brand-dot';
+    render();
+    // Fetch historical in background (cached daily, won't refire unless needed)
+    fetchAllHistorical().catch(e => console.warn('Hist background fetch:', e));
   } catch (e) {
     dot.className = 'brand-dot error';
     toast('Erreur cotations: ' + e.message, 'err');
@@ -1171,17 +1262,12 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Settings — sync
   document.getElementById('ghToken').value = settings.ghToken || '';
   document.getElementById('ghGistId').value = settings.gistId || '';
-  document.getElementById('patriTotal').value = settings.patrimoineTotal || '';
   document.getElementById('refreshInterval').value = String(settings.refreshInterval ?? 60);
 
   document.getElementById('ghToken').addEventListener('change', e => { settings.ghToken = e.target.value.trim(); saveLocal(); });
   document.getElementById('ghGistId').addEventListener('change', e => { settings.gistId = e.target.value.trim(); saveLocal(); });
   document.getElementById('refreshInterval').addEventListener('change', e => {
     settings.refreshInterval = parseInt(e.target.value); saveLocal(); setupAutoRefresh();
-  });
-  document.getElementById('savePatri').addEventListener('click', () => {
-    settings.patrimoineTotal = parseFloat(document.getElementById('patriTotal').value) || 0;
-    saveLocal(); toast('Enregistré', 'ok');
   });
 
   document.getElementById('syncPull').addEventListener('click', pullFromGist);
